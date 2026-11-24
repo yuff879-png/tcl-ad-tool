@@ -1,2 +1,21 @@
-# tcl-ad-tool
-TCL 广告投放工作台：Windows 便携版、版本发布与在线更新。发布包不含个人配置或业务数据。
+# TCL 广告投放工作台
+
+Windows 便携版 TRON 广告投放工具，支持 TRC20、TRC10、钱包池、投放统计及 Energy Desk 平台联动。
+
+## 安装
+
+从 [正式版本](https://github.com/yuff879-png/tcl-ad-tool/releases/latest) 下载 `tcl-ad-tool-版本-win-x64.zip`，完整解压后运行“一键启动.cmd”。发布安装包包含经过校验的 Node.js 和 Electron；GitHub 的 Source code 压缩包是源码，不能直接当安装包使用。
+
+已有安装可在软件内检查并安装更新。升级前保留完整 data 文件夹；更新后任务保持暂停，钱包池保持锁定。
+
+## 1.3.8
+
+绑定平台后上报真实运行状态、成功扫描时间与扫描高度；支持从自己账户的地址页确认远程启动正式投放。启动沿用本机参数和原预检，过期指令、旧进程和变更后的参数不会再次执行。程序必须已打开并联网；平台不能远程唤醒已关闭的电脑或程序。
+
+## 源码与验证
+
+应用源码、测试和使用文档位于 `app/`。依赖安装使用 `npm ci`；运行要求 Node.js 24.15.x，完整桌面环境还需经官方哈希校验的 Electron 45.3.3。
+
+在 app 目录运行 `node --disable-warning=ExperimentalWarning --test --test-timeout=60000 test/*.test.js`。完整发行流程还包含运行环境检查、凭据扫描、签名包校验、正式旧版原更新器升级、配置/数据库/钱包保留检查及公开下载哈希验证。
+
+便携运行时、node_modules、个人数据、钱包及签名私钥不进入源码仓库。维护脚本保留在仓库根目录与 verification；签名密钥由维护者在仓库外安全保存，发行时读取本机未跟踪的 .release-keys 目录。

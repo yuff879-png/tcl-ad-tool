@@ -1,0 +1,30 @@
+# Dependencies and verified portable runtimes
+**/node_modules/
+**/runtime/
+# Personal data, credentials and temporary release artifacts
+**/data/
+**/.env
+**/.env.*
+**/*.sqlite*
+**/*.db*
+**/pool-vault.json
+**/config.json
+**/instance.json
+.release-keys/
+*.pem
+*.key
+*.zip
+*.exe
+release/
+delivery-candidate/
+publish/
+output/
+outputs/
+source-release/
+verification/*/
+verification/*.json
+verification/*.log
+verification/*.txt
+__pycache__/
+*.pyc
+delivery.json
