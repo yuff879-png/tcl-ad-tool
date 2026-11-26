@@ -80,6 +80,18 @@ class Store {
       }
       if (!this.db.prepare('PRAGMA table_info(delivery_attempts)').all().some(c => c.name === 'wallet')) this.db.exec('ALTER TABLE delivery_attempts ADD COLUMN wallet TEXT');
       this.db.exec('CREATE INDEX IF NOT EXISTS delivery_wallet_status ON deliveries(wallet,status)');
+      this.transaction(() => {
+        const columns = this.db.prepare('PRAGMA table_info(deliveries)').all().map(c => c.name);
+        for (const [name, definition] of [['source_kind', "TEXT NOT NULL DEFAULT 'scan'"], ['manual_batch_id', 'TEXT'], ['manual_position', 'INTEGER']]) {
+          if (!columns.includes(name)) this.db.exec(`ALTER TABLE deliveries ADD COLUMN ${name} ${definition}`);
+        }
+        this.db.exec(`CREATE TABLE IF NOT EXISTS manual_batches(
+          id TEXT PRIMARY KEY, confirmation_hash TEXT NOT NULL UNIQUE, mode TEXT NOT NULL,
+          asset_type TEXT NOT NULL, token TEXT NOT NULL, amount TEXT NOT NULL, rpc TEXT NOT NULL,
+          total INTEGER NOT NULL, summary_json TEXT NOT NULL, created_at TEXT NOT NULL);
+          CREATE INDEX IF NOT EXISTS delivery_manual_batch ON deliveries(manual_batch_id,status);
+          CREATE INDEX IF NOT EXISTS delivery_queue_source ON deliveries(mode,asset_type,token,status,source_kind);`);
+      });
     } catch (error) { this.db.close(); throw error; }
   }
   getMeta(key) { const row = this.db.prepare('SELECT value FROM meta WHERE key=?').get(key); return row ? JSON.parse(row.value) : null; }
@@ -101,7 +113,14 @@ class Store {
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(crypto.randomUUID(), mode, candidate.to, candidate.txid,
       candidate.asset, candidate.amount, config.tokenContract, config.sendAmount, 'queued', now, now, blockHeight, config.rpcUrl, config.assetType || 'TRC20', (config.assetType || 'TRC20') + ':' + config.tokenContract).changes > 0;
   }
-  next(mode, config) { return this.db.prepare(`SELECT * FROM deliveries WHERE mode=? AND status='queued' ${config ? 'AND asset_type=? AND token=?' : ''} ORDER BY created_at,rowid LIMIT 1`).get(mode, ...(config ? [config.assetType || 'TRC20', config.tokenContract] : [])); }
+  next(mode, config) { return this.db.prepare(`SELECT d.* FROM deliveries d LEFT JOIN manual_batches b ON b.id=d.manual_batch_id
+    WHERE d.mode=? AND d.status='queued' ${config ? 'AND d.asset_type=? AND d.token=?' : ''}
+    ORDER BY (d.source_kind='manual') DESC,b.rowid,d.manual_position,d.created_at,d.rowid LIMIT 1`).get(mode, ...(config ? [config.assetType || 'TRC20', config.tokenContract] : [])); }
+  queueSummary(mode, config) {
+    const rows = this.db.prepare(`SELECT source_kind,COUNT(*) count FROM deliveries WHERE mode=? AND asset_type=? AND token=? AND status='queued' GROUP BY source_kind`)
+      .all(mode, config.assetType || 'TRC20', config.tokenContract);
+    return { manual: rows.find(r => r.source_kind === 'manual')?.count || 0, scan: rows.find(r => r.source_kind === 'scan')?.count || 0 };
+  }
   get(id) { return this.db.prepare('SELECT * FROM deliveries WHERE id=?').get(id); }
   energyOrder(id) { return this.db.prepare('SELECT * FROM energy_orders WHERE delivery_id=?').get(id) || null; }
   energyIntent(row, config) {
@@ -148,12 +167,12 @@ class Store {
   deferRetry(row, retryAfter) { this.retryInfo(row); this.db.prepare('UPDATE delivery_retry SET retry_after=? WHERE delivery_id=?').run(retryAfter, row.id); }
   exhaustRetry(row) { this.retryInfo(row); this.db.prepare('UPDATE delivery_retry SET exhausted=1 WHERE delivery_id=?').run(row.id); }
   nextRetry(config, wallet, now = Date.now(), excluded = []) {
-    return this.db.prepare(`SELECT d.* FROM deliveries d LEFT JOIN delivery_retry r ON r.delivery_id=d.id
+    return this.db.prepare(`SELECT d.* FROM deliveries d LEFT JOIN delivery_retry r ON r.delivery_id=d.id LEFT JOIN manual_batches b ON b.id=d.manual_batch_id
       WHERE d.mode='live' AND d.status IN ('prepared','pending','uncertain')
         AND COALESCE(r.exhausted,0)=0 AND COALESCE(r.retry_after,0)<=?
         AND d.token=? AND d.amount=? AND d.rpc=? AND d.asset_type=? ${config.assetType === 'TRC10' ? '' : 'AND d.wallet=?'}
         ${excluded.length ? 'AND d.id NOT IN (' + excluded.map(() => '?').join(',') + ')' : ''}
-      ORDER BY d.created_at,d.rowid LIMIT 1`).get(now, config.tokenContract, config.sendAmount, config.rpcUrl, config.assetType || 'TRC20', ...(config.assetType === 'TRC10' ? [] : [wallet]), ...excluded);
+      ORDER BY (d.source_kind='manual') DESC,b.rowid,d.manual_position,d.created_at,d.rowid LIMIT 1`).get(now, config.tokenContract, config.sendAmount, config.rpcUrl, config.assetType || 'TRC20', ...(config.assetType === 'TRC10' ? [] : [wallet]), ...excluded);
   }
   queued(mode, config) { return this.db.prepare(`SELECT * FROM deliveries WHERE mode=? AND status='queued' ${config ? 'AND asset_type=? AND token=?' : ''} ORDER BY created_at,rowid`).all(mode, ...(config ? [config.assetType || 'TRC20', config.tokenContract] : [])); }
   skipUnsent(mode) {
@@ -273,7 +292,7 @@ class Store {
   }
   records({ search = '', mode = '', status = '', page = 1, limit = 50 } = {}) {
     const filters = [], params = [];
-    if (search) { filters.push('(instr(address,?)>0 OR instr(source_tx,?)>0 OR instr(COALESCE(txid,\'\'),?)>0)'); params.push(search, search, search); }
+    if (search) { filters.push('(instr(address,?)>0 OR instr(source_tx,?)>0 OR instr(COALESCE(txid,\'\'),?)>0 OR instr(COALESCE(manual_batch_id,\'\'),?)>0)'); params.push(search, search, search, search); }
     if (mode) { filters.push('mode=?'); params.push(mode); }
     if (status) { filters.push('status=?'); params.push(status); }
     const where = filters.length ? ' WHERE ' + filters.join(' AND ') : '';

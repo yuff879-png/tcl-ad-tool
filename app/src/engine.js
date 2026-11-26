@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const { Trc10Chain, validateNative } = require('./trc10');
 const { isRateLimitError, initialNodeStatus, COOLDOWN_MS } = require('./node-access');
 const { ManualRetry } = require('./manual-retry');
+const { ManualBatches } = require('./manual-batches');
 const REVIEW_PENDING = ['prepared', 'pending', 'uncertain', 'executed'];
 const REVIEW_FAILURES = new Set(['REVERT', 'BAD_JUMP_DESTINATION', 'OUT_OF_MEMORY', 'PRECOMPILED_CONTRACT', 'STACK_TOO_SMALL', 'STACK_TOO_LARGE', 'ILLEGAL_OPERATION', 'STACK_OVERFLOW', 'OUT_OF_ENERGY', 'OUT_OF_TIME', 'JVM_STACK_OVER_FLOW', 'TRANSFER_FAILED', 'INVALID_CODE']);
 // This is only a waiting policy for stopping an old local investigation. It is
@@ -29,6 +30,7 @@ class Engine {
     this.energyRecovery = null; this.energyRecoveryTimer = null; this.energyRecoveryPass = null;
     this.energyRecoveryAllowed = false;
     this.manualRetry = new ManualRetry(this);
+    this.manualBatches = new ManualBatches(this); this.runId = null;
   }
   log(level, message) { this.store.log(level, redact(message, this.getConfig())); }
   getChain(config, queueGroup = 'foreground') {
@@ -86,11 +88,13 @@ class Engine {
     }
     if (token.rawBalance === null || BigInt(token.rawBalance) < BigInt(rawAmount)) throw new Error('广告代币余额不足');
   }
-  async start(mode, preflight, recovery = null, { assertCurrent = () => {} } = {}) {
+  async start(mode, preflight, recovery = null, { assertCurrent = () => {}, beforeRun = null } = {}) {
     assertCurrent();
     if (this.closed) throw new Error('程序已关闭');
     if (!['simulate', 'live'].includes(mode)) throw new Error('运行模式无效');
     if (this.busy || ['starting', 'running', 'stopping'].includes(this.state)) throw new Error('任务正在运行或停止中');
+    if (!beforeRun) this.manualBatches.cancelPreview();
+    this.runId = crypto.randomUUID();
     const config = effectiveConfig(validate(this.getConfig(), mode));
     if (recovery) this.assertEnergyRecovery(recovery);
     else this.cancelEnergyRecovery();
@@ -144,6 +148,9 @@ class Engine {
           }
         }
         this.store.setMeta(this.cursorKey, this.height);
+        // Admit a newly confirmed manual batch atomically after the restart
+        // policy, before either worker can claim its first delivery.
+        beforeRun?.();
       });
       if (recovery) {
         clearTimeout(this.energyRecoveryTimer); this.energyRecoveryTimer = null; this.energyRecovery = null;
@@ -244,6 +251,7 @@ class Engine {
   wakeAll() { for (const finish of [...this.waiters]) finish(); }
   stop() {
     this.onManualStop?.();
+    this.manualBatches.cancelPreview();
     this.manualRetry.cancel();
     this.cancelEnergyRecovery('已取消自动恢复；后续需手动启动');
     if (this.state === 'starting') throw new Error('预检正在完成，请稍后暂停');
@@ -258,6 +266,7 @@ class Engine {
     await this.stopAndWait(); await this.confirmationPass; await this.statisticsPass;
   }
   fail(error) {
+    this.manualBatches.cancelPreview();
     if (error.code !== 'INSUFFICIENT_ENERGY') {
       this.cancelEnergyRecovery();
       if (this.failure?.code === 'INSUFFICIENT_ENERGY') this.failure = error;
@@ -372,12 +381,12 @@ class Engine {
     if (!this.running) return false;
     if (this.config.assetType === 'TRC10') {
       const cutoff = new Date(Date.now() - this.config.queueTtlMinutes * 60000).toISOString();
-      this.store.db.prepare("UPDATE deliveries SET status='skipped_restart',dedupe_cleared_at=?,updated_at=?,detail='等待资源超过有效期，已略过' WHERE asset_type='TRC10' AND status='queued' AND created_at<? AND txid IS NULL").run(new Date().toISOString(), new Date().toISOString(), cutoff);
-      const queued = this.store.db.prepare("SELECT COUNT(*) n FROM deliveries WHERE asset_type='TRC10' AND status='queued'").get().n;
+      this.store.db.prepare("UPDATE deliveries SET status='skipped_restart',dedupe_cleared_at=?,updated_at=?,detail='等待资源超过有效期，已略过' WHERE asset_type='TRC10' AND source_kind='scan' AND status='queued' AND created_at<? AND txid IS NULL").run(new Date().toISOString(), new Date().toISOString(), cutoff);
+      const queued = this.store.db.prepare("SELECT COUNT(*) n FROM deliveries WHERE asset_type='TRC10' AND source_kind='scan' AND status='queued'").get().n;
       if (queued + candidates.length > this.config.maxQueue) { this.resourceWait = '等待队列已满，保留当前区块进度'; return false; }
     }
     if (this.config.assetType === 'TRC20' && this.energyPolicy?.linked()) {
-      const queued = this.store.db.prepare("SELECT COUNT(*) n FROM deliveries WHERE mode=? AND asset_type='TRC20' AND token=? AND status='queued'").get(this.mode, this.config.tokenContract).n;
+      const queued = this.store.db.prepare("SELECT COUNT(*) n FROM deliveries WHERE mode=? AND asset_type='TRC20' AND token=? AND source_kind='scan' AND status='queued'").get(this.mode, this.config.tokenContract).n;
       if (queued + candidates.length > this.config.maxQueue) { this.resourceWait = '平台等待队列已满，保留当前区块进度'; return false; }
     }
     let offered = 0;
@@ -472,11 +481,11 @@ class Engine {
     }
     if (this.config.assetType === 'TRC10') {
       const cutoff = new Date(Date.now() - this.config.queueTtlMinutes * 60000).toISOString();
-      this.store.db.prepare("UPDATE deliveries SET status='skipped_restart',dedupe_cleared_at=?,detail='超过等待有效期' WHERE mode=? AND asset_type='TRC10' AND status='queued' AND created_at<? AND txid IS NULL").run(new Date().toISOString(), this.mode, cutoff);
+      this.store.db.prepare("UPDATE deliveries SET status='skipped_restart',dedupe_cleared_at=?,detail='超过等待有效期' WHERE mode=? AND asset_type='TRC10' AND source_kind='scan' AND status='queued' AND created_at<? AND txid IS NULL").run(new Date().toISOString(), this.mode, cutoff);
     }
     const queued = this.store.next(this.mode, this.config);
     const retry = this.mode === 'live' ? this.store.nextRetry(this.config, this.chain.wallet, Date.now(), [...this.confirmingIds]) : null;
-    const row = retry || queued;
+    const row = queued?.source_kind === 'manual' && retry?.source_kind !== 'manual' ? queued : retry || queued;
     if (!row || !this.running) return false;
     if (this.config.blacklist.includes(row.address) || row.address === walletAddress(this.config) || this.pool?.ownAddress(row.address)) {
       if (row.txid) this.store.deferRetry(row, Date.now() + 60000);

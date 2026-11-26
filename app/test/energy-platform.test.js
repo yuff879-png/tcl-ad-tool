@@ -70,6 +70,18 @@ test('platform cannot raise the locally configured execution fee limit', async t
   assert.equal(f.chains.find(c => c.signed)?.config.feeLimitTrx, '1');
 });
 
+test('manual priority batches use the existing platform gateway and retain its pending-order protection', async t => {
+  const f = await fixture(t, { lowResources: true }), scanned = f.offer(3);
+  const p = await f.engine.manualBatches.prepare({ text: [address(4), address(5)].join('\n'), mode: 'live' });
+  await f.engine.manualBatches.submit({ confirmationToken: p.confirmationToken, confirmed: true });
+  await f.engine.sendNext();
+  assert.equal(f.calls.admit[0].recipient_address, address(4)); assert.equal(f.calls.submit.length, 1);
+  assert.equal(f.store.get(scanned.id).status, 'queued');
+  await f.engine.sendNext(); assert.equal(f.calls.submit.length, 1);
+  assert.equal(f.chains.reduce((n, chain) => n + chain.broadcasts, 0), 0);
+  assert.match(f.engine.resourceWait, /原订单/);
+});
+
 test('startup locks the engine before awaiting platform policy', async t => {
   const f = await fixture(t); f.engine.stop(); await f.engine.loopPromise; f.engine.state = 'stopped';
   let release;

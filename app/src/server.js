@@ -105,6 +105,10 @@ async function createApp({ dataDir = process.env.TCL_DATA_DIR || path.join(ROOT,
   let boundPort;
   function assertIdle(allowEnergyRecovery = false) { if (installing) throw new Error('正在安装更新，请等待新窗口打开'); if (operation || pool.running || engine.busy || (!allowEnergyRecovery && engine.energyRecovery) || ['running', 'starting', 'stopping'].includes(engine.state)) throw new Error('请先暂停任务或取消自动恢复，等待当前处理完成后再操作'); }
   async function exclusive(fn, allowEnergyRecovery = false) { assertIdle(allowEnergyRecovery); operation = true; try { return await fn(); } finally { operation = false; } }
+  async function batchOperation(fn) {
+    if (operation || installing || closing || closed || pool.running) throw new Error('其他操作正在进行，请稍后添加批量投放');
+    operation = true; try { return await fn(); } finally { operation = false; }
+  }
   const runtimeControl = new RuntimeControl(store, () => config, engine, { factory: rentalFactory, instanceId,
     idleReason: () => closing || closed ? '程序正在退出' : installing ? '正在安装更新' : operation || pool.running ? '本机操作正在进行' : '',
     startLive: assertCurrent => exclusive(async () => {
@@ -281,7 +285,7 @@ async function createApp({ dataDir = process.env.TCL_DATA_DIR || path.join(ROOT,
           }
           case 'POST /api/config': {
             if (['energyTransport', 'platformUrl', 'platformToken', 'platformDeviceId', 'platformWallet'].some(k => Object.hasOwn(input, k)) || input.clearSecrets?.includes('platformToken')) throw new Error('请使用平台连接面板绑定或安全断开');
-            assertIdle(true); const next = validate(normalize(input, config)); engine.manualRetry.cancel();
+            assertIdle(true); const next = validate(normalize(input, config)); engine.manualRetry.cancel(); engine.manualBatches.cancelPreview();
             engine.cancelEnergyRecovery('设置已修改，已取消自动恢复；请重新预检并手动启动');
             if (next.assetType !== config.assetType || effectiveConfig(next).tokenContract !== effectiveConfig(config).tokenContract) {
               // Changing campaigns never turns an old unknown broadcast into a
@@ -317,9 +321,14 @@ async function createApp({ dataDir = process.env.TCL_DATA_DIR || path.join(ROOT,
             result = engine.snapshot(); break;
           }
           case 'POST /api/stop':
-            if (runtimeControl.execution && engine.state === 'starting') engine.fail(new Error('本机已暂停，取消远程启动'));
+            if ((runtimeControl.execution || engine.manualBatches.starting) && engine.state === 'starting') engine.fail(new Error('本机已暂停，取消本次启动'));
             else engine.stop();
             await pool.stop(); result = engine.snapshot(); break;
+          case 'GET /api/manual-batches': result = { ...engine.manualBatches.list(url.searchParams.get('page')),
+            queue: store.queueSummary(engine.running ? engine.mode : (url.searchParams.get('mode') === 'simulate' ? 'simulate' : 'live'), effectiveConfig(config)) }; break;
+          case 'POST /api/manual-batches/prepare': result = await batchOperation(() => engine.manualBatches.prepare(input)); break;
+          case 'POST /api/manual-batches/submit': result = await batchOperation(() => engine.manualBatches.submit(input)); break;
+          case 'POST /api/manual-batches/cancel': result = await batchOperation(() => engine.manualBatches.cancel(String(input.id || ''))); break;
           case 'POST /api/reconcile': result = await exclusive(() => engine.reconcile()); break;
           case 'POST /api/records/recheck': result = await exclusive(() => engine.reviewRecord(String(input.id || ''))); break;
           case 'POST /api/records/prepare-retry': result = await exclusive(() => engine.manualRetry.prepare(String(input.id || ''))); break;
@@ -386,6 +395,7 @@ async function createApp({ dataDir = process.env.TCL_DATA_DIR || path.join(ROOT,
         return send(res, 200, result);
       }
       const files = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/pool.js': ['pool.js', 'text/javascript; charset=utf-8'],
+        '/batches.js': ['batches.js', 'text/javascript; charset=utf-8'],
         '/style.css': ['style.css', 'text/css; charset=utf-8'], '/icon.svg': ['icon.svg', 'image/svg+xml'] };
       if (req.method !== 'GET' || !files[url.pathname]) return send(res, 404, 'Not found', 'text/plain');
       const [file, type] = files[url.pathname]; return send(res, 200, fs.readFileSync(path.join(ROOT, 'public', file)), type);

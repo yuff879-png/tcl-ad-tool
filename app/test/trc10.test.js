@@ -97,6 +97,20 @@ test('insufficient free bandwidth waits without signing, attempts or failure str
   assert.equal(await f.engine.sendNext(), false); assert.equal(f.broadcasts, 0); assert.equal(f.store.get(row.id).status, 'queued');
   assert.equal(f.store.retryInfo(row).attempts, 0); assert.equal(f.engine.failureStreak(), 0); assert.match(f.engine.resourceWait, /免费带宽/);
 });
+
+test('manual TRC10 batches use the same free-bandwidth pool, stay ahead of scans and do not age out as triggers', async t => {
+  const f = setup(t); await wallets(f); f.engine.loop = async () => {};
+  await f.engine.start('live'); const scanned = queue(f);
+  const p = await f.engine.manualBatches.prepare({ text: [address(4), address(5)].join('\n'), mode: 'live' });
+  const result = await f.engine.manualBatches.submit({ confirmationToken: p.confirmationToken, confirmed: true });
+  f.store.db.prepare('UPDATE deliveries SET created_at=? WHERE manual_batch_id=?').run('2020-01-01T00:00:00Z', result.id);
+  await f.engine.sendNext(); await f.engine.confirmExecuted();
+  await f.engine.sendNext(); await f.engine.confirmExecuted();
+  const manual = f.store.records({ search: result.id }).items;
+  assert.equal(f.broadcasts, 2); assert.ok(manual.every(row => row.status === 'confirmed' && row.asset_type === 'TRC10' && row.token === '1000016'));
+  assert.equal(f.store.get(scanned.id).status, 'queued'); assert.equal(f.store.next('live', effectiveConfig(f.c)).id, scanned.id);
+  assert.ok(manual.every(row => f.store.db.prepare('SELECT 1 FROM pool_wallets WHERE address=?').get(row.wallet)));
+});
 test('linked seamless policy keeps TRC10 local broadcasts and permits the next free pool wallet', async t => {
   const f = setup(t); await wallets(f); f.engine.loop = async () => {};
   f.engine.energyPolicy = { linked: () => true, refreshForSend: async () => 'seamless', requireMode: () => 'seamless' };

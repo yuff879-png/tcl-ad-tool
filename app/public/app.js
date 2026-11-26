@@ -26,8 +26,8 @@ let statisticsFilter = { period: '15', timeZone: 'Asia/Shanghai', token: 'curren
 let recordDialog = null, recordDialogSequence = 0;
 let backendConnected = false;
 let settingsGroup = 'strategy', addressGroup = 'watch';
-const pageEyebrows = { pool: 'WALLET POOL', overview: 'WORKSPACE OVERVIEW', statistics: 'CAMPAIGN ANALYTICS', settings: 'CAMPAIGN SETTINGS', addresses: 'AUDIENCE MANAGEMENT', records: 'DELIVERY HISTORY', guide: 'SUPPORT & MAINTENANCE' };
-const titles = { pool: ['投放钱包池', '数量自定义、分批准备，只使用免费带宽轮换投放。'], overview: ['投放总览', '从链上转账发现目标地址，按规则完成代币触达。'], settings: ['投放参数', '把投放策略、钱包和资源条件放在同一个地方。'],
+const pageEyebrows = { batches: 'MANUAL DELIVERY', pool: 'WALLET POOL', overview: 'WORKSPACE OVERVIEW', statistics: 'CAMPAIGN ANALYTICS', settings: 'CAMPAIGN SETTINGS', addresses: 'AUDIENCE MANAGEMENT', records: 'DELIVERY HISTORY', guide: 'SUPPORT & MAINTENANCE' };
+const titles = { batches: ['批量投放', '手动名单优先发送，链上扫描照常运行。'], pool: ['投放钱包池', '数量自定义、分批准备，只使用免费带宽轮换投放。'], overview: ['投放总览', '从链上转账发现目标地址，按规则完成代币触达。'], settings: ['投放参数', '把投放策略、钱包和资源条件放在同一个地方。'],
   statistics: ['投放统计', '按日查看投放数量与实际消耗，掌握每一次触达的成本。'],
   addresses: ['地址管理', '明确监听谁、跳过谁，让每次投放符合你的规则。'], records: ['投放记录', '从触发交易到链上到账，每个地址都有完整记录。'], guide: ['使用与迁移', '一次准备，随文件夹带走你的运行环境和投放进度。'] };
 const statuses = { queued: ['等待投放', 'neutral'], prepared: ['已准备 / 待核查', 'warning'], pending: ['等待链上确认', 'warning'], uncertain: ['需核查', 'error'],
@@ -83,6 +83,7 @@ function go(page) {
   $$('[data-heading]').forEach(el => { el.hidden = !el.dataset.heading.split(' ').includes(page); });
   document.title = titles[page][0] + ' · TCL 广告投放工作台';
   (windowControls?.visible ? document.body : window).scrollTo({ top: 0 });
+  if (page === 'batches') loadManualBatches().catch(error => toast(error.message, true));
   if (page === 'pool') loadPool().catch(error => toast(error.message, true));
   if (page === 'records') loadRecords().catch(error => toast(error.message, true));
   if (page === 'statistics') loadStatistics();
@@ -228,6 +229,7 @@ function updateControls() {
   const label = pendingAction ? '处理中…' : selectedMode === 'live' ? '开始正式投放' : '开始模拟监听';
   $('#start').innerHTML = uiIcon('play') + label;
   $('#start').hidden = Boolean(active); $('#stop').hidden = !active;
+  if (typeof batchControls === 'function') batchControls();
 }
 function selectMode(mode) {
   selectedMode = mode;
@@ -299,7 +301,7 @@ async function stopRecordRetry() {
 }
 function recordDetails(row) {
   const state = statuses[row.status] || [row.status, 'neutral'];
-  return details([['状态', state[0]], ['收款地址', row.address], ['广告合约', row.token], ['投放数量', row.amount], ['触发交易哈希', row.source_tx], ['投放交易哈希', row.txid || '未广播'],
+  return details([['状态', state[0]], ['收款地址', row.address], ['广告合约', row.token], ['投放数量', row.amount], ['来源', row.source_kind === 'manual' ? '手动批量投放 · ' + row.manual_batch_id : '链上扫描'], ['触发交易哈希', row.source_asset === 'MANUAL' ? '手动添加，无触发交易' : row.source_tx], ['投放交易哈希', row.txid || '未广播'],
     ['发送尝试', row.energyOrder?.submitted ? '平台提交；不在本地重发' : row.retry ? `${row.retry.attempts} / 4 次（首次 + 最多补试 3 次）${row.retry.exhausted ? '；已停止重试' : ''}` : '旧版记录，首次处理时补齐'],
     ['地址去重', row.dedupe_cleared_at ? `已于 ${time(row.dedupe_cleared_at)} 解除，历史明细保留` : '保留'], ['记录说明', row.detail], ['更新时间', time(row.updated_at)]])
     + (row.energyOrder?.submitted ? details([['平台订单', row.energyOrder.order_id || row.energyOrder.intent_id], ['广播路线', row.energyOrder.route === 'catfee' ? '无感补能' : row.energyOrder.route === 'local' ? '已有资源直发' : '待确认'],
@@ -586,6 +588,7 @@ function renderState(state) {
     text('#migration-notes', notes.join('\n'));
   }
   if (typeof renderPoolUI === 'function') renderPoolUI(state);
+  if (currentPage === 'batches' && Date.now() - batchRefreshedAt > 2000) loadManualBatches().catch(error => toast(error.message, true));
   updateControls();
 }
 async function loadLogs() {
@@ -621,7 +624,7 @@ async function loadRecords() {
   for (const row of result.items) {
     const state = statuses[row.status] || [row.status, 'neutral'];
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td><span class="record-time">${escapeHtml(time(row.created_at))}<small>${row.mode === 'live' ? '正式投放' : '模拟监听'} · 本机时间</small></span></td><td title="${escapeHtml(row.address)}"><code class="address-value">${escapeHtml(short(row.address))}</code></td><td class="number">${escapeHtml(row.source_amount)}<span class="cell-unit">${escapeHtml(row.source_asset)}</span></td><td class="number quantity-cell">${escapeHtml(row.amount)}<small class="record-token" title="${escapeHtml(row.token)}">${escapeHtml(short(row.token))}</small></td><td><span class="badge ${state[1]}"><span class="dot"></span>${escapeHtml(state[0])}</span></td><td class="align-right"><button class="text-button">${row.manualRetry?.canPrepare ? '补发 / 查看' : row.recovery?.can_recheck ? '核查 / 处理' : '查看'} ${uiIcon('chevron-right')}</button></td>`;
+    tr.innerHTML = `<td><span class="record-time">${escapeHtml(time(row.created_at))}<small>${row.mode === 'live' ? '正式投放' : '模拟监听'} · 本机时间</small></span></td><td title="${escapeHtml(row.address)}"><code class="address-value">${escapeHtml(short(row.address))}</code></td><td class="number">${row.source_kind === 'manual' ? '<span class="badge purple">手动批量</span>' : escapeHtml(row.source_amount) + '<span class="cell-unit">' + escapeHtml(row.source_asset) + '</span>'}</td><td class="number quantity-cell">${escapeHtml(row.amount)}<small class="record-token" title="${escapeHtml(row.token)}">${escapeHtml(short(row.token))}</small></td><td><span class="badge ${state[1]}"><span class="dot"></span>${escapeHtml(state[0])}</span></td><td class="align-right"><button class="text-button">${row.manualRetry?.canPrepare ? '补发 / 查看' : row.recovery?.can_recheck ? '核查 / 处理' : '查看'} ${uiIcon('chevron-right')}</button></td>`;
     tr.querySelector('button').addEventListener('click', () => showRecordDetail(row));
     $('#records-body').append(tr);
   }
@@ -930,7 +933,7 @@ function renderStatisticsTrend(items) {
   $('#trend').classList.toggle('no-data', !items.length);
 }
 function recordTimeline(row) {
-  const stages = [{ label: '规则命中，已生成投放记录', done: true }];
+  const stages = [{ label: row.source_kind === 'manual' ? '手动批次已确认，进入优先队列' : '规则命中，已生成投放记录', done: true }];
   if (row.txid) stages.push({ label: '已准备交易哈希；发送状态以回执为准', done: true });
   if (['executed', 'confirmed'].includes(row.status)) stages.push({ label: '执行成功，已核对到账金额', done: true });
   const final = { confirmed: ['已最终确认到账', true], executed: ['后台核查最终确认及实际消耗', false],
