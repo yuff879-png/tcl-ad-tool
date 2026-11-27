@@ -53,7 +53,6 @@ class Store {
         });
       }
       this.db.exec(`CREATE INDEX IF NOT EXISTS delivery_status ON deliveries(mode,status);
-        CREATE UNIQUE INDEX IF NOT EXISTS active_delivery_address ON deliveries(mode,asset_scope,address) WHERE dedupe_cleared_at IS NULL;
         CREATE TABLE IF NOT EXISTS delivery_receipts(
           delivery_id TEXT PRIMARY KEY, txid TEXT NOT NULL COLLATE NOCASE, block_time INTEGER,
           energy TEXT, fee_sun TEXT, checked_at TEXT, retry_after INTEGER NOT NULL DEFAULT 0,
@@ -82,7 +81,7 @@ class Store {
       this.db.exec('CREATE INDEX IF NOT EXISTS delivery_wallet_status ON deliveries(wallet,status)');
       this.transaction(() => {
         const columns = this.db.prepare('PRAGMA table_info(deliveries)').all().map(c => c.name);
-        for (const [name, definition] of [['source_kind', "TEXT NOT NULL DEFAULT 'scan'"], ['manual_batch_id', 'TEXT'], ['manual_position', 'INTEGER']]) {
+        for (const [name, definition] of [['source_kind', "TEXT NOT NULL DEFAULT 'scan'"], ['manual_batch_id', 'TEXT'], ['manual_position', 'INTEGER'], ['manual_repeat', 'INTEGER NOT NULL DEFAULT 0 CHECK(manual_repeat IN (0,1))']]) {
           if (!columns.includes(name)) this.db.exec(`ALTER TABLE deliveries ADD COLUMN ${name} ${definition}`);
         }
         this.db.exec(`CREATE TABLE IF NOT EXISTS manual_batches(
@@ -91,6 +90,22 @@ class Store {
           total INTEGER NOT NULL, summary_json TEXT NOT NULL, created_at TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS delivery_manual_batch ON deliveries(manual_batch_id,status);
           CREATE INDEX IF NOT EXISTS delivery_queue_source ON deliveries(mode,asset_type,token,status,source_kind);`);
+        if (!this.db.prepare('PRAGMA table_info(manual_batches)').all().some(c => c.name === 'history_policy')) {
+          this.db.exec("ALTER TABLE manual_batches ADD COLUMN history_policy TEXT NOT NULL DEFAULT 'dedupe' CHECK(history_policy IN ('dedupe','repeat'))");
+        }
+        const batchColumns = this.db.prepare('PRAGMA table_info(manual_batches)').all().map(c => c.name);
+        for (const [name, definition] of [['paused', 'INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0,1))'], ['last_resume_hash', 'TEXT']]) {
+          if (!batchColumns.includes(name)) this.db.exec(`ALTER TABLE manual_batches ADD COLUMN ${name} ${definition}`);
+        }
+        const recipientIndex = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='active_delivery_address'").get();
+        if (!recipientIndex?.sql.includes('manual_repeat')) {
+          // Keep every old row and its dedupe state. Only explicitly confirmed
+          // repeat rows are exempt from the ordinary recipient uniqueness rule.
+          this.db.exec(`DROP INDEX IF EXISTS active_delivery_address;
+            CREATE UNIQUE INDEX active_delivery_address ON deliveries(mode,asset_scope,address) WHERE dedupe_cleared_at IS NULL AND manual_repeat=0;`);
+        }
+        this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS manual_batch_recipient ON deliveries(manual_batch_id,address) WHERE manual_batch_id IS NOT NULL;
+          CREATE INDEX IF NOT EXISTS delivery_recipient_history ON deliveries(mode,address,asset_scope);`);
       });
     } catch (error) { this.db.close(); throw error; }
   }
@@ -114,7 +129,7 @@ class Store {
       candidate.asset, candidate.amount, config.tokenContract, config.sendAmount, 'queued', now, now, blockHeight, config.rpcUrl, config.assetType || 'TRC20', (config.assetType || 'TRC20') + ':' + config.tokenContract).changes > 0;
   }
   next(mode, config) { return this.db.prepare(`SELECT d.* FROM deliveries d LEFT JOIN manual_batches b ON b.id=d.manual_batch_id
-    WHERE d.mode=? AND d.status='queued' ${config ? 'AND d.asset_type=? AND d.token=?' : ''}
+    WHERE d.mode=? AND d.status='queued' AND COALESCE(b.paused,0)=0 ${config ? 'AND d.asset_type=? AND d.token=?' : ''}
     ORDER BY (d.source_kind='manual') DESC,b.rowid,d.manual_position,d.created_at,d.rowid LIMIT 1`).get(mode, ...(config ? [config.assetType || 'TRC20', config.tokenContract] : [])); }
   queueSummary(mode, config) {
     const rows = this.db.prepare(`SELECT source_kind,COUNT(*) count FROM deliveries WHERE mode=? AND asset_type=? AND token=? AND status='queued' GROUP BY source_kind`)
@@ -169,19 +184,21 @@ class Store {
   nextRetry(config, wallet, now = Date.now(), excluded = []) {
     return this.db.prepare(`SELECT d.* FROM deliveries d LEFT JOIN delivery_retry r ON r.delivery_id=d.id LEFT JOIN manual_batches b ON b.id=d.manual_batch_id
       WHERE d.mode='live' AND d.status IN ('prepared','pending','uncertain')
+        AND COALESCE(b.paused,0)=0
         AND COALESCE(r.exhausted,0)=0 AND COALESCE(r.retry_after,0)<=?
         AND d.token=? AND d.amount=? AND d.rpc=? AND d.asset_type=? ${config.assetType === 'TRC10' ? '' : 'AND d.wallet=?'}
         ${excluded.length ? 'AND d.id NOT IN (' + excluded.map(() => '?').join(',') + ')' : ''}
       ORDER BY (d.source_kind='manual') DESC,b.rowid,d.manual_position,d.created_at,d.rowid LIMIT 1`).get(now, config.tokenContract, config.sendAmount, config.rpcUrl, config.assetType || 'TRC20', ...(config.assetType === 'TRC10' ? [] : [wallet]), ...excluded);
   }
-  queued(mode, config) { return this.db.prepare(`SELECT * FROM deliveries WHERE mode=? AND status='queued' ${config ? 'AND asset_type=? AND token=?' : ''} ORDER BY created_at,rowid`).all(mode, ...(config ? [config.assetType || 'TRC20', config.tokenContract] : [])); }
+  queued(mode, config) { return this.db.prepare(`SELECT d.* FROM deliveries d LEFT JOIN manual_batches b ON b.id=d.manual_batch_id
+    WHERE d.mode=? AND d.status='queued' AND COALESCE(b.paused,0)=0 ${config ? 'AND d.asset_type=? AND d.token=?' : ''} ORDER BY d.created_at,d.rowid`).all(mode, ...(config ? [config.assetType || 'TRC20', config.tokenContract] : [])); }
   skipUnsent(mode) {
     const at = new Date().toISOString();
     // Only never-broadcast rows can be abandoned. Their source transaction remains
     // unique, but a later NEW trigger may offer the same recipient again.
     return this.db.prepare(`UPDATE deliveries SET status='skipped_restart',updated_at=?,dedupe_cleared_at=?,
       detail='按重新启动设置略过：中断前尚未发送；仅允许以后的新交易重新触发'
-      WHERE mode=? AND status='queued' AND txid IS NULL`).run(at, at, mode).changes;
+      WHERE mode=? AND status='queued' AND txid IS NULL AND source_kind!='manual'`).run(at, at, mode).changes;
   }
   update(id, status, values = {}) {
     const allowed = ['txid', 'detail', 'raw_amount', 'wallet'];

@@ -98,8 +98,8 @@ test('version 1 database migration backs up and preserves records, queue, cursor
   const store = new Store(directory);
   try {
     const after = store.db.prepare('SELECT rowid,* FROM deliveries ORDER BY rowid').all();
-    assert.deepEqual(after.map(({ dedupe_cleared_at, asset_type, asset_scope, source_kind, manual_batch_id, manual_position, ...row }) => ({ ...row })), before.map(row => ({ ...row })));
-    assert.ok(after.every(row => row.source_kind === 'scan' && row.manual_batch_id === null && row.manual_position === null));
+    assert.deepEqual(after.map(({ dedupe_cleared_at, asset_type, asset_scope, source_kind, manual_batch_id, manual_position, manual_repeat, ...row }) => ({ ...row })), before.map(row => ({ ...row })));
+    assert.ok(after.every(row => row.source_kind === 'scan' && row.manual_batch_id === null && row.manual_position === null && row.manual_repeat === 0));
     assert.ok(after.every(row => row.dedupe_cleared_at === null && row.asset_type === 'TRC20' && row.asset_scope === ''));
     assert.equal(store.next('live').id, 'id4'); assert.equal(store.pending()[0].id, 'id5');
     assert.equal(store.getMeta('cursor:live'), 123); assert.equal(store.deliveredCounts().live, 2);

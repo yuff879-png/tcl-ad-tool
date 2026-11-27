@@ -302,6 +302,7 @@ async function stopRecordRetry() {
 function recordDetails(row) {
   const state = statuses[row.status] || [row.status, 'neutral'];
   return details([['状态', state[0]], ['收款地址', row.address], ['广告合约', row.token], ['投放数量', row.amount], ['来源', row.source_kind === 'manual' ? '手动批量投放 · ' + row.manual_batch_id : '链上扫描'], ['触发交易哈希', row.source_asset === 'MANUAL' ? '手动添加，无触发交易' : row.source_tx], ['投放交易哈希', row.txid || '未广播'],
+    ...(row.manual_repeat ? [['本次地址处理', '已确认向历史地址再次投放；原记录与去重保留']] : []),
     ['发送尝试', row.energyOrder?.submitted ? '平台提交；不在本地重发' : row.retry ? `${row.retry.attempts} / 4 次（首次 + 最多补试 3 次）${row.retry.exhausted ? '；已停止重试' : ''}` : '旧版记录，首次处理时补齐'],
     ['地址去重', row.dedupe_cleared_at ? `已于 ${time(row.dedupe_cleared_at)} 解除，历史明细保留` : '保留'], ['记录说明', row.detail], ['更新时间', time(row.updated_at)]])
     + (row.energyOrder?.submitted ? details([['平台订单', row.energyOrder.order_id || row.energyOrder.intent_id], ['广播路线', row.energyOrder.route === 'catfee' ? '无感补能' : row.energyOrder.route === 'local' ? '已有资源直发' : '待确认'],

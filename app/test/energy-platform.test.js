@@ -91,6 +91,21 @@ test('startup locks the engine before awaiting platform policy', async t => {
   release(); await starting;
 });
 
+test('repeat batches wait for old platform settlement and then create a distinct intent', async t => {
+  const f = await fixture(t), old = f.offer(4);
+  f.store.update(old.id, 'confirmed', { txid: 'b'.repeat(64) });
+  const order = f.store.energyIntent(old, f.c);
+  f.store.updateEnergyOrder(old.id, { submitted: 1, resolved: 0, transaction_status: 'success' });
+  assert.equal((await f.engine.manualBatches.prepare({ text: old.address, mode: 'live', historyPolicy: 'repeat' })).eligible, 0);
+  f.store.updateEnergyOrder(old.id, { resolved: 1 });
+  const p = await f.engine.manualBatches.prepare({ text: old.address, mode: 'live', historyPolicy: 'repeat' });
+  assert.equal(p.counts.repeated, 1);
+  await f.engine.manualBatches.submit({ confirmationToken: p.confirmationToken, confirmed: true, confirmRepeat: true });
+  const row = f.store.next('live', f.c); await f.engine.sendNext();
+  assert.equal(f.calls.submit.length, 1); assert.notEqual(f.store.energyOrder(row.id).intent_id, order.intent_id);
+  assert.equal(f.store.get(old.id).status, 'confirmed'); assert.equal(f.store.get(old.id).dedupe_cleared_at, null);
+});
+
 test('lost submit response and a missing order never cause local or platform resubmission', async t => {
   const f = await fixture(t, { timeout: true }); const row = f.offer(); await f.engine.sendNext();
   f.client.byIntent = async () => { f.calls.query.push('404'); throw Object.assign(new Error('not found'), { status: 404 }); };

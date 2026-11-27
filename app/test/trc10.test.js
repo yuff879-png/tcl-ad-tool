@@ -119,6 +119,20 @@ test('linked seamless policy keeps TRC10 local broadcasts and permits the next f
   const first = queue(f); await f.engine.sendNext(); assert.equal(f.broadcasts, 1); assert.equal(f.store.get(first.id).status, 'pending');
   queue(f, address(4), 'c'.repeat(64)); await f.engine.sendNext(); assert.equal(f.broadcasts, 2);
 });
+
+test('TRC10 repeat batches preserve history and send through the same free-bandwidth pool', async t => {
+  const f = setup(t); await wallets(f); f.engine.loop = async () => {}; await f.engine.start('live');
+  const old = queue(f); await f.engine.sendNext(); await f.engine.confirmExecuted();
+  const original = { ...f.store.get(old.id) }; assert.equal(original.status, 'confirmed');
+  assert.equal((await f.engine.manualBatches.prepare({ text: old.address, mode: 'live' })).eligible, 0);
+  const p = await f.engine.manualBatches.prepare({ text: old.address, mode: 'live', historyPolicy: 'repeat' });
+  assert.equal(p.counts.repeated, 1);
+  await f.engine.manualBatches.submit({ confirmationToken: p.confirmationToken, confirmed: true, confirmRepeat: true });
+  const next = f.store.next('live', effectiveConfig(f.c)); assert.equal(next.manual_repeat, 1);
+  await f.engine.sendNext(); await f.engine.confirmExecuted();
+  assert.equal(f.broadcasts, 2); assert.equal(f.store.get(next.id).status, 'confirmed');
+  assert.notEqual(f.store.get(next.id).txid, original.txid); assert.deepEqual({ ...f.store.get(old.id) }, original);
+});
 test('pause during candidate lookup prevents native signature and broadcast', async t => {
   const f = setup(t); await wallets(f); f.engine.loop = async () => {}; await f.engine.start('live'); queue(f);
   let signed = 0; const inspect = f.chain.inspectWallet.bind(f.chain), build = f.chain.buildNative.bind(f.chain);

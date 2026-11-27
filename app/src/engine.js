@@ -255,6 +255,7 @@ class Engine {
     this.manualRetry.cancel();
     this.cancelEnergyRecovery('已取消自动恢复；后续需手动启动');
     if (this.state === 'starting') throw new Error('预检正在完成，请稍后暂停');
+    this.manualBatches.holdUnsent();
     if (!this.running) return;
     this.running = false; this.state = 'stopping'; this.wakeAll();
     this.log('info', '正在暂停：不再开始新投放；已广播交易继续核查');
@@ -267,6 +268,7 @@ class Engine {
   }
   fail(error) {
     this.manualBatches.cancelPreview();
+    this.manualBatches.holdUnsent();
     if (error.code !== 'INSUFFICIENT_ENERGY') {
       this.cancelEnergyRecovery();
       if (this.failure?.code === 'INSUFFICIENT_ENERGY') this.failure = error;
@@ -785,7 +787,14 @@ class Engine {
   }
   async sendLoop() {
     while (this.running) {
+        // A quick pause/resume (including a process restart) must not shorten
+        // the interval following the last completed sending attempt.
+        const lastFinished = Number(this.store.getMeta('last-send-finished-at')) || 0;
+        const remaining = lastFinished + this.config.sendIntervalSeconds * 1000 - Date.now();
+        if (remaining > 0) await this.wait(Math.min(remaining, this.config.sendIntervalSeconds * 1000));
+        if (!this.running) break;
         const processed = await this.sendNext();
+        if (processed) this.store.setMeta('last-send-finished-at', Date.now());
         if (this.config.maxPerRun > 0 && this.metrics.sent + this.metrics.simulated >= this.config.maxPerRun) {
           this.log('info', `已达到本次 ${this.config.maxPerRun} 个地址上限，自动暂停`); this.running = false; this.wakeAll(); break;
         }
@@ -801,6 +810,7 @@ class Engine {
     // Await both workers even after an error: an already-broadcast send must finish
     // reconciliation before the app can unlock settings or close its database.
     await Promise.all([guard(this.scanLoop()), guard(this.sendLoop())]);
+    this.manualBatches.holdUnsent();
     if (!this.closed) await this.confirmExecuted();
     if (this.failure) { this.state = 'fault'; this.lastError = redact(this.failure.message || String(this.failure), this.config); }
     else { this.state = 'stopped'; this.log('info', '任务已暂停；进度已保存，已发送交易继续在后台核查最终确认'); }

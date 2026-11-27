@@ -328,6 +328,8 @@ async function createApp({ dataDir = process.env.TCL_DATA_DIR || path.join(ROOT,
             queue: store.queueSummary(engine.running ? engine.mode : (url.searchParams.get('mode') === 'simulate' ? 'simulate' : 'live'), effectiveConfig(config)) }; break;
           case 'POST /api/manual-batches/prepare': result = await batchOperation(() => engine.manualBatches.prepare(input)); break;
           case 'POST /api/manual-batches/submit': result = await batchOperation(() => engine.manualBatches.submit(input)); break;
+          case 'POST /api/manual-batches/prepare-resume': result = await batchOperation(() => engine.manualBatches.prepareResume(String(input.id || ''))); break;
+          case 'POST /api/manual-batches/resume': result = await batchOperation(() => engine.manualBatches.resume(input)); break;
           case 'POST /api/manual-batches/cancel': result = await batchOperation(() => engine.manualBatches.cancel(String(input.id || ''))); break;
           case 'POST /api/reconcile': result = await exclusive(() => engine.reconcile()); break;
           case 'POST /api/records/recheck': result = await exclusive(() => engine.reviewRecord(String(input.id || ''))); break;
